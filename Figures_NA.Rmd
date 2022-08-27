@@ -1,0 +1,86 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r setup}
+pacman::p_load(
+  owidR,COVID19,
+  tidyverse,tidymodels,
+  zoo,timetk,naniar,scales
+  )
+
+Sys.setlocale("LC_TIME", "English")
+options(scipen = 999)
+
+```
+
+
+NAs di Y
+
+```{r}
+db$db0 %>% group_by(g) %>%
+  summarise(
+    pop = first(pop),
+    y_NAs = n_miss(y),
+    x1_NAs = n_miss(x_000),
+    x2_NAs = n_miss(x_100)
+  ) %>%
+  ggplot(aes(x = y_NAs,y = pop))+
+  geom_point()+
+  geom_text(aes(label=ifelse(y_NAs>27,
+                             as.character(g),
+                             '')),
+            hjust=.5,vjust=-1,
+            size=3) +
+  theme_test()+
+  scale_y_continuous(
+    trans= log10_trans(),
+    breaks = trans_breaks("log10", function(x) 10^x),
+    labels = trans_format("log10", math_format(10^.x))
+    ) +
+  ylab(expression(population)) +
+  xlab("missing values")
+```
+
+
+NAs di X
+
+```{r}
+db$db0 %>% group_by(g) %>%
+  summarise(
+    pop = first(pop),
+    y_NAs = n_miss(y),
+    x0_NAs = n_miss(x_010),
+    x1_NAs = n_miss(x_110)
+  ) %>%
+  ggplot(aes(x = x1_NAs,y = pop))+
+  geom_point()+
+  geom_text(aes(label=ifelse(
+    (x0_NAs>335) | (log10(pop)>8.35) ,
+    as.character(g),
+                             '')),
+            hjust=.5,vjust=-1,
+            size=2.5, color = "red") +
+  theme_test()+
+  scale_y_continuous(
+    trans= log10_trans(),
+    breaks = trans_breaks("log10", function(x) 10^x),
+    labels = trans_format("log10", math_format(10^.x))
+    ) +
+  ylab(expression(population)) +
+  xlab("missing values")
+```
+
+---
+
+Naniar of controls:
+
+```{r}
+db$db0 %>% group_by(g) %>% slice_sample(n = 175) %>%
+  ungroup() %>%
+  select(pos_rt,hosp,icu,LKDW,OXSI) %>%
+  vis_miss(show_perc = F, warn_large_data = T) +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+```
