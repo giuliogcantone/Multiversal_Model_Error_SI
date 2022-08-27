@@ -1,0 +1,255 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+If you miss pacman
+
+```{r pre-setup}
+install.packages("pacman")
+```
+
+This will be helpful later
+
+```{r}
+db = list()
+```
+
+
+### Setup
+
+```{r setup}
+pacman::p_load(
+  owidR,COVID19,
+  tidyverse,zoo,timetk,naniar,scales
+  )
+
+Sys.setlocale("LC_TIME", "English")
+options(scipen = 999)
+
+```
+
+Data download
+
+```{r}
+owid_covid() %>%
+  filter(date >= "2020-12-09",
+         date < "2022-01-22",
+         !is.na(continent),
+         ) %>% as_tibble() -> db$db_owid
+```
+
+```{r}
+covid19(level = 1, start = ("2020-12-01"),
+        verbose = FALSE) %>%
+  filter(date >= "2020-12-09",
+         date < "2022-01-22") %>%
+      rename(
+        t = date,
+        g = administrative_area_level_1,
+        pop = population) %>%
+  relocate(t,g,pop) %>%
+  as_tibble() %>% group_by(pop) -> db$db_ga
+
+```
+
+First pre-processing to remove odd locations.
+
+```{r}
+intersect(db$db_owid %>%
+            filter(date == "2020-12-09") %>%
+            pull(location),
+          db$db_ga %>%
+            filter(t == "2020-12-09") %>%
+            pull(g)
+) %>% intersect(
+  db$db_owid %>% group_by(location) %>%
+  summarise(y_NAs = n_miss(new_deaths)) %>%
+    filter(y_NAs < 175) %>%
+    pull(location)
+) %>% .[. != "Eritrea"] -> db$countries
+```
+
+Second preprocessing
+
+```{r}
+db$db_owid %>% rename(
+  t = date,
+  g = location
+) %>% left_join(db$db_ga %>% select(t,g,pop),
+            by = c("t","g"),
+            .after = "g") %>% group_by(g) %>%
+  transmute(t,g,pop = median(pop, na.rm = T),
+  pop_d = population_density,
+  age65 = aged_65_older/100,
+  pos_rt = positive_rate,
+  hosp = hosp_patients,
+  icu = icu_patients,
+  y = new_deaths,
+  x_000 = people_vaccinated/pop,
+  x_100 = people_fully_vaccinated/pop,
+  ) %>%
+  filter(g %in% db$countries,
+         pop > 30000) %>% ungroup() -> db$db0
+
+```
+
+Finding first day of vaccination campaign, imputations, interpolations.
+
+```{r}
+db$db0 %>%
+  group_by(g) %>%
+  mutate(
+    first_r = first(na.omit(x_000)),
+                      ) %>%
+  filter(x_000 == first_r) %>%
+  transmute(first_t = t, g) %>%
+  left_join(db$db0,., by = "g") %>%
+  rowwise() %>%
+  mutate(
+    t_1 = case_when(
+      t < first_t ~ 0,
+      t == first_t ~ 1,
+      t > first_t ~ as.numeric(t-first_t)+1
+      ),
+    x_010 = ifelse(t_1 == 0,0,x_000),
+    x_110 = ifelse(t_1 == 0,0,x_100),
+    ) %>%
+  group_by(g) %>%
+  mutate(
+    x_001 = na.approx(x_000,na.rm = F),
+    x_101 = na.approx(x_100,na.rm = F),
+    x_011 = na.approx(x_010,na.rm = F),
+    x_111 = na.approx(x_110,na.rm = F)
+    ) %>% ungroup() %>%
+  select(-c(first_t)) %>%
+  relocate(t,t_1) %>%
+  ungroup %>%
+  left_join(db$db_ga %>%
+              ungroup %>%
+              transmute(t,g,
+                     LKDW= stay_home_restrictions,
+                     OXSI= stringency_index/100),
+            by = c("t","g")
+            ) -> db$db0
+
+```
+
+Lagging the database
+
+```{r}
+
+db$db0 %>% add_column(lag = "7") %>%
+  group_by(g) %>%
+  mutate(y = lag_vec(y,-7)
+    ) %>% ungroup() %>% add_row(
+
+db$db0 %>% add_column(lag = "14") %>%
+  group_by(g) %>%
+  mutate(y = lag_vec(y,-14)
+    ) %>% ungroup()) %>% add_row(
+
+db$db0 %>% add_column(lag = "21") %>%
+  group_by(g) %>%
+  mutate(y = lag_vec(y,-21)
+    ) %>% ungroup()
+
+) -> db$dblags
+```
+
+---
+
+Model cookbooks
+
+```{r}
+models = list()
+```
+
+Pooled and mixed models
+
+```{r}
+
+models$PQP <- function(formula, data, ...) {
+  formula <- paste(formula, "+ log(pop)") %>% as.formula()
+  feglm(data = data,
+           family = quasipoisson,
+           fml = formula,
+           se = "hetero")}
+
+models$PNB <- function(formula, data, ...) {
+  formula <- paste(formula, "+ log(pop)") %>% as.formula()
+  fenegbin(data = data,
+           fml = formula,
+           se = "hetero")}
+
+models$PQPt0 <- function(formula, data, ...) {
+  formula <- paste(formula, "+ log(pop) | t") %>% as.formula()
+  feglm(data = data,
+           family = quasipoisson,
+           fml = formula,
+           se = "hetero")}
+
+models$PNBt0 <- function(formula, data, ...) {
+  formula <- paste(formula, "+ log(pop) | t") %>% as.formula()
+  fenegbin(data = data,
+           fml = formula,
+           se = "hetero")}
+
+models$PQPt1 <- function(formula, data, ...) {
+  formula <- paste(formula, "+ log(pop) | t_1") %>% as.formula()
+  feglm(data = data,
+           family = quasipoisson,
+           fml = formula,
+           se = "hetero")}
+
+models$PNBt1 <- function(formula, data, ...) {
+  formula <- paste(formula, "+ log(pop) | t_1") %>% as.formula()
+  fenegbin(data = data,
+           fml = formula,
+           se = "hetero")}
+```
+
+Within models
+
+```{r}
+
+models$WQP <- function(formula, data, ...) {
+  formula <- paste(formula, "| g") %>% as.formula()
+  feglm(data = data,
+           family = quasipoisson,
+           fml = formula,
+           se = "hetero")}
+
+models$WNB <- function(formula, data, ...) {
+  formula <- paste(formula, "| g") %>% as.formula()
+  fenegbin(data = data,
+           fml = formula,
+           se = "hetero")}
+
+models$WQPt0 <- function(formula, data, ...) {
+  formula <- paste(formula, "| g + t") %>% as.formula()
+  feglm(data = data,
+           family = quasipoisson,
+           fml = formula,
+           se = "hetero")}
+
+models$WNBt0 <- function(formula, data, ...) {
+  formula <- paste(formula, "| g + t") %>% as.formula()
+  fenegbin(data = data,
+           fml = formula,
+           se = "hetero")}
+
+models$WQPt1 <- function(formula, data, ...) {
+  formula <- paste(formula, "| g + t_1") %>% as.formula()
+  feglm(data = data,
+           family = quasipoisson,
+           fml = formula,
+           se = "hetero")}
+
+models$WNBt1 <- function(formula, data, ...) {
+  formula <- paste(formula, "| g + t_1") %>% as.formula()
+  fenegbin(data = data,
+           fml = formula,
+           se = "hetero")}
+
+```

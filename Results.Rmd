@@ -1,0 +1,365 @@
+---
+title: "Multiverse"
+output: html_notebook
+---
+
+Run this setup to download
+
+```{r setup}
+
+pacman::p_load(
+  tidyverse,
+  broom, broom.mixed,
+  specr,fixest
+)
+
+get_model <- function(x) {
+  x_str <- str2lang(x)
+  if (is.name(x_str)) {
+    return(x)
+  } else if (is.call(x_str)) {
+    eval(x_str)
+  }
+}
+
+run_spec2 <- function (specs, df, conf.level, keep.results = FALSE) 
+{
+  results <- specs %>% dplyr::mutate(
+    formula = pmap(specs,
+                   specr:::create_formula)) %>%
+    tidyr::unnest(formula) %>% dplyr::mutate(
+      res = map2(.data$model,
+                 formula,
+                 ~do.call(get_model(.x),
+                          list(data = df,
+                                   formula = .y)))) %>% 
+    dplyr::mutate(coefs = map(.data$res, broom.mixed::tidy,
+                              conf.int = TRUE, 
+                              conf.level = conf.level),
+                  fit = map(.data$res,
+                            broom.mixed::glance
+                            )) %>% 
+    tidyr::unnest(.data$coefs) %>% tidyr::unnest(.data$fit, 
+                                                 names_sep = "_")
+  if ("op" %in% names(results)) {
+    results <- results %>%
+      dplyr::filter(.data$term == paste(.data$y,
+                                        "~",
+                                        .data$x))
+  }
+  else {
+    results <- results %>% dplyr::filter(.data$term == .data$x)
+  }
+  results <- results %>% dplyr::select(-.data$formula, -.data$term)
+  if (isFALSE(keep.results)) {
+    results <- results %>% dplyr::select(-.data$res)
+  }
+  return(results)
+}
+
+run_specs2 <- function (df, x, y, model = "lm", controls = NULL, subsets = NULL, 
+          all.comb = FALSE, conf.level = 0.95, keep.results = FALSE) 
+{
+  if (rlang::is_missing(x)) {
+    stop("You must specify at least one independent variable `x`.")
+  }
+  if (rlang::is_missing(y)) {
+    stop("You must specify at least one dependent variable `y`.")
+  }
+  specs <- setup_specs(y = y, x = x, model = model,
+                       controls = controls, 
+                       all.comb = all.comb)
+  if (!is.null(subsets)) {
+    if (class(subsets) != "list") {
+      wrong_class <- class(subsets)
+      stop(glue("Subsets must be a 'list' and not a '{wrong_class}'."))
+    }
+    subsets <- map(subsets, as.character)
+    df_list <- specr:::create_subsets(df, subsets)
+    df_list[[length(df_list) + 1]] <- df %>% dplyr::mutate(filter = "all")
+    if (length(subsets) > 1) {
+      suppressMessages({
+        df_comb <- subsets %>% cross %>%
+          map(~specr:::create_subsets(subsets = .x,
+                                      df = df) %>%
+                map(~dplyr::select(.x, -filter)) %>%
+                reduce(dplyr::inner_join) %>%
+                dplyr::mutate(filter = paste(names(.x),
+                                             .x,
+                                             collapse = " & ",
+                                             sep = " = ")))
+        
+        df_all <- append(df_list, df_comb)
+      })
+    }
+    else {
+      df_all <- df_list
+    }
+    if (conf.level > 1 | conf.level < 0) {
+      stop("The confidence level must be strictly greater than 0 and less than 1.")
+    }
+    map_df(df_all, ~run_spec2(specs, .x, conf.level = conf.level, 
+                             keep.results = keep.results) %>% dplyr::mutate(subsets = unique(.x$filter)))
+  }
+  else {
+    run_spec2(specs, df, conf.level = conf.level, keep.results = keep.results) %>% 
+      dplyr::mutate(subsets = "all")
+  }
+}
+
+```
+
+The next code will generate the specifications with W-estimation.
+
+```{r}
+run_specs2(df = db$dblags,
+          y = c("y"),
+          x = db$dblags %>%
+            select(starts_with("x")) %>%
+            names(),
+          controls = c("OXSI","LKDW","pos_rt"),
+          all.comb = T,
+          model = paste0("models$",names(models)[7:12]),
+          subsets = list(lag = unique(db$dblags$lag))
+          ) -> MultiverseW
+```
+
+The next code will generate the specifications with FP-estimation, controlled by "LKDW".
+
+```{r}
+run_specs2(df = db$dblags,
+          y = c("y"),
+          x = db$dblags %>%
+            select(starts_with("x")) %>%
+            names(),
+          controls = c("LKDW","pos_rt","age65","pop_d"),
+          all.comb = T,
+          model = paste0("models$",names(models)[1:6]),
+          subsets = list(lag = unique(db$dblags$lag))
+          ) -> MultiverseP65L
+```
+
+The next code will generate the specifications with FP-estimation, controlled by "OXSI".
+
+```{r}
+run_specs2(df = db$dblags,
+          y = c("y"),
+          x = db$dblags %>%
+            select(starts_with("x")) %>%
+            names(),
+          controls = c("OXSI","pos_rt","age65","pop_d"),
+          all.comb = T,
+          model = paste0("models$",names(models)[1:6]),
+          subsets = list(lag = unique(db$dblags$lag))
+          ) -> MultiverseP65O
+```
+
+
+Multiverse final pre-processing.
+
+```{r}
+
+MultiverseW %>%
+  add_row(MultiverseP65O) %>%
+  add_row(MultiverseP65L) %>%
+  filter(subsets != "all") %>%
+  filter(!(str_detect(controls, "OXSI") &
+             str_detect(controls, "LKDW")),
+         (str_detect(controls, "OXSI") |
+             str_detect(controls, "LKDW"))
+         ) %>%
+  distinct() %>%
+#  mutate(
+#    std.error = exp(estimate + std.error),
+#    estimate = exp(estimate),
+#    std.error = std.error - estimate,
+#    estimate = 1 - estimate,
+#    conf.low = 1 - exp(conf.low),
+#    conf.high = 1 - exp(conf.high)
+  #) %>%
+  mutate(across(where(is.numeric),round,3)) %>%
+    mutate(x2 = str_remove(x,"x_")) %>%
+  separate(x2,c("A","Type_vax","nat_0","Interp"),
+           sep = "") %>%
+  transmute(
+    Estimator =
+      case_when(str_detect(model,"W")~"Within",
+                TRUE ~ "Pooled"),
+    Time_contr = 
+      case_when(endsWith(model,"0")~"t0",
+                endsWith(model,"1")~"t1",
+                TRUE ~ "No"),
+    Overdisp =
+      case_when(str_detect(model,"NB")~"NB",
+                TRUE ~ "QP"),
+    Type_vax =
+      case_when(Type_vax == 0~"min_vax",
+                TRUE ~ "full_vav"),
+    nat_0, Interp,
+    Lag = subsets %>% str_remove("lag = "),
+    Policy =
+      case_when(str_detect(controls,"LKDW")~"LKDW",
+                str_detect(controls,"OXSI")~"OXSI",
+                TRUE ~ "No"),
+    Pos_rate =
+      case_when(str_detect(controls,"pos_r")~"1",
+                TRUE ~ "0"),
+    Age =
+      case_when(str_detect(controls,"age")~"1",
+                TRUE ~ "0"),
+    Pop_d =
+      case_when(str_detect(controls,"pop_d")~"1",
+                TRUE ~ "0"),
+    estimate,std.error,p.value,conf.low,conf.high,
+    n_na = 76074 - fit_nobs,
+    x,y,model,controls,subsets
+  ) %>%
+  mutate(
+    id = row_number(),
+    .before = "Estimator"
+  ) -> Multiverse
+
+```
+
+Finding delta neighbors
+
+```{r}
+as.matrix(Multiverse[2:10]) -> M
+val.ord <- unique(c(M))
+val.ord <- setNames(seq_along(val.ord), val.ord)
+M[] <- val.ord[M]
+mode(M) <- 'numeric'
+
+Multiverse$J_delta <- apply(M, 1, function(row) 
+  which(colSums(t(M) - row != 0) == 1))
+
+rm(db,get_model,M,models,MultiverseP65L,MultiverseP65O,MultiverseW,run_spec2,run_specs2,val.ord)
+
+```
+
+
+```{r}
+Multiverse %>%
+  mutate(
+    delta.error =
+      map2_dbl(
+        estimate,
+        J_delta,
+        function(x,y) max(
+          sqrt(
+            (x - Multiverse$estimate[
+              Multiverse$id %in% unlist(y)
+              ]
+             )^2
+            ),na.rm = T)
+        )
+  )%>%
+  mutate(
+    w = max(delta.error)-delta.error,
+    w = w/sum(w)
+) -> Multiverse
+
+```
+
+
+```{r}
+Multiverse %>%
+  ggplot(aes(estimate)) +
+  geom_density() +
+  geom_vline(aes(xintercept=1),
+             linetype=1, size=0.5) +
+  geom_text(aes(label = "null = 1",
+                y=.5, x=.6))+
+  geom_vline(aes(xintercept=mean(estimate)),
+             linetype="dashed", size=0.5) +
+  geom_text(aes(label = str_c(
+    "avg(b)=",
+    (mean(estimate) %>% round(3))
+    ), y=.45, x=mean(estimate) - 1)) +
+    geom_vline(aes(xintercept=median(estimate)),
+             linetype=4, size=0.5) +
+  geom_text(aes(label = str_c(
+    "med(b)=",
+    (median(estimate) %>% round(3))
+    ), y=.015, x=median(estimate) + .85)) +
+  xlab(expression(b[x]))+
+  ylab(expression(P(b[x]))) +
+  theme_test() +
+  theme(axis.title.y = element_text(angle = 0))
+
+Multiverse %>%
+  ggplot(aes(estimate)) +
+  geom_density(aes(weight = w)) +
+  geom_vline(aes(xintercept=1),
+             linetype=1, size=0.5) +
+  geom_text(aes(label = "null = 1",
+                y=.5, x=.6))+
+  geom_vline(aes(xintercept=sum(estimate*w)),
+             linetype="dashed", size=0.5) +
+  geom_text(aes(label = str_c(
+    "sum(w * b)=",
+    (sum(estimate*w) %>% round(3))
+    ), y=.525, x=sum(estimate*w) - 1.2))+
+  xlab(expression(b[x]))+
+  ylab(expression(wP(b[x]))) +
+  theme_test() +
+  theme(axis.title.y = element_text(angle = 0))
+
+
+
+```
+
+```{r}
+Multiverse %>%
+  specr::plot_curve(null = 1) +
+  ylab(expression(b[x]))+
+  xlab(expression(rank(b[x]))) +
+  theme_test() +
+  theme(axis.title.y = element_text(angle = 0))
+
+Multiverse %>%
+  specr::plot_choices(null = 1,
+                      choices = c("Estimator",
+                                  "Overdisp",
+                                  "Policy",
+                                  "Lag")
+  )
+  
+```
+
+
+```{r}
+
+(Multiverse %>% filter(p.value < .05,
+                      estimate > 1) %>% nrow() /
+  Multiverse %>% nrow()) *
+  (Multiverse %>% filter(p.value < .05,
+                      estimate < 1) %>% nrow() /
+  Multiverse %>% nrow()) *
+  2
+
+(Multiverse %>% filter(p.value < .05,
+                      estimate > 1) %>% summarise(
+                        sum = sum(w))
+  ) %>%
+    pull(sum) *
+  (Multiverse %>% filter(p.value < .05,
+                      estimate < 1) %>% summarise(
+                        sum = sum(w))
+   ) %>%
+    pull(sum) *
+  2
+  
+```
+```{r}
+Multiverse %>% ggplot(aes(x = rank(estimate),
+                          y = w)) +
+  geom_bar(stat="identity") +
+  xlab(expression(rank(b[x])))+
+  ylab(expression(w)) +
+  theme_test() +
+  theme(axis.title.y = element_text(angle = 0))
+
+```
+
+
